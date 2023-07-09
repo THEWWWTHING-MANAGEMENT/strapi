@@ -28,7 +28,7 @@
   },
   "dependencies": {
     "@strapi/design-system": "1.7.10",
-    "@strapi/icons": "1.7.10",
+    "@strapi/icons": "1.8.1",
     "@strapi/provider-email-sendmail": "4.10.7",
     "@strapi/utils": "4.10.7",
     "lodash": "4.17.21",
