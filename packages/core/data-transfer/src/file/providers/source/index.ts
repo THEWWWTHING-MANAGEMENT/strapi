@@ -1,19 +1,19 @@
 import type { Readable } from 'stream';
 
-import fs from 'fs-extra';
 import zip from 'zlib';
-import tar from 'tar';
 import path from 'path';
+import { pipeline, PassThrough } from 'stream';
+import fs from 'fs-extra';
+import tar from 'tar';
 import { isEmpty, keyBy } from 'lodash/fp';
 import { chain } from 'stream-chain';
-import { pipeline, PassThrough } from 'stream';
 import { parser } from 'stream-json/jsonl/Parser';
-import type { Schema } from '@strapi/strapi';
+import type { Struct } from '@strapi/types';
 
-import type { IAsset, IMetadata, ISourceProvider, ProviderType } from '../../../../types';
+import type { IAsset, IMetadata, ISourceProvider, ProviderType, IFile } from '../../../../types';
+import type { IDiagnosticReporter } from '../../../utils/diagnostic';
 
-import { createDecryptionCipher } from '../../../utils/encryption';
-import { collect } from '../../../utils/stream';
+import * as utils from '../../../utils';
 import { ProviderInitializationError, ProviderTransferError } from '../../../errors/providers';
 import { isFilePathInDirname, isPathEquivalent, unknownPathToPosix } from './utils';
 
@@ -29,16 +29,16 @@ const METADATA_FILE_PATH = 'metadata.json';
  */
 export interface ILocalFileSourceProviderOptions {
   file: {
-    path: string;
+    path: string; // the file to load
   };
 
   encryption: {
-    enabled: boolean;
-    key?: string;
+    enabled: boolean; // if the file is encrypted (and should be decrypted)
+    key?: string; // the key to decrypt the file
   };
 
   compression: {
-    enabled: boolean;
+    enabled: boolean; // if the file is compressed (and should be decompressed)
   };
 }
 
@@ -55,6 +55,8 @@ class LocalFileSourceProvider implements ISourceProvider {
 
   #metadata?: IMetadata;
 
+  #diagnostics?: IDiagnosticReporter;
+
   constructor(options: ILocalFileSourceProviderOptions) {
     this.options = options;
 
@@ -65,10 +67,22 @@ class LocalFileSourceProvider implements ISourceProvider {
     }
   }
 
+  #reportInfo(message: string) {
+    this.#diagnostics?.report({
+      details: {
+        createdAt: new Date(),
+        message,
+        origin: 'file-source-provider',
+      },
+      kind: 'info',
+    });
+  }
+
   /**
    * Pre flight checks regarding the provided options, making sure that the file can be opened (decrypted, decompressed), etc.
    */
-  async bootstrap() {
+  async bootstrap(diagnostics: IDiagnosticReporter) {
+    this.#diagnostics = diagnostics;
     const { path: filePath } = this.options.file;
 
     try {
@@ -94,7 +108,13 @@ class LocalFileSourceProvider implements ISourceProvider {
     this.#metadata = await this.#parseJSONFile<IMetadata>(backupStream, METADATA_FILE_PATH);
   }
 
+  async #loadAssetMetadata(path: string) {
+    const backupStream = this.#getBackupStream();
+    return this.#parseJSONFile<IFile>(backupStream, path);
+  }
+
   async getMetadata() {
+    this.#reportInfo('getting metadata');
     if (!this.#metadata) {
       await this.#loadMetadata();
     }
@@ -103,28 +123,39 @@ class LocalFileSourceProvider implements ISourceProvider {
   }
 
   async getSchemas() {
-    const schemas = await collect<Schema>(this.createSchemasReadStream());
+    this.#reportInfo('getting schemas');
+    const schemaCollection = await utils.stream.collect<Struct.Schema>(
+      this.createSchemasReadStream()
+    );
 
-    if (isEmpty(schemas)) {
+    if (isEmpty(schemaCollection)) {
       throw new ProviderInitializationError('Could not load schemas from Strapi data file.');
     }
 
-    return keyBy('uid', schemas);
+    // Group schema by UID
+    const schemas = keyBy('uid', schemaCollection);
+
+    // Transform to valid JSON
+    return utils.schema.schemasToValidJSON(schemas);
   }
 
   createEntitiesReadStream(): Readable {
+    this.#reportInfo('creating entities read stream');
     return this.#streamJsonlDirectory('entities');
   }
 
   createSchemasReadStream(): Readable {
+    this.#reportInfo('creating schemas read stream');
     return this.#streamJsonlDirectory('schemas');
   }
 
   createLinksReadStream(): Readable {
+    this.#reportInfo('creating links read stream');
     return this.#streamJsonlDirectory('links');
   }
 
   createConfigurationReadStream(): Readable {
+    this.#reportInfo('creating configuration read stream');
     // NOTE: TBD
     return this.#streamJsonlDirectory('configuration');
   }
@@ -132,6 +163,8 @@ class LocalFileSourceProvider implements ISourceProvider {
   createAssetsReadStream(): Readable | Promise<Readable> {
     const inStream = this.#getBackupStream();
     const outStream = new PassThrough({ objectMode: true });
+    const loadAssetMetadata = this.#loadAssetMetadata.bind(this);
+    this.#reportInfo('creating assets read stream');
 
     pipeline(
       [
@@ -144,12 +177,18 @@ class LocalFileSourceProvider implements ISourceProvider {
             }
             return isFilePathInDirname('assets/uploads', filePath);
           },
-          onentry(entry) {
+          async onentry(entry) {
             const { path: filePath, size = 0 } = entry;
             const normalizedPath = unknownPathToPosix(filePath);
             const file = path.basename(normalizedPath);
-
+            let metadata;
+            try {
+              metadata = await loadAssetMetadata(`assets/metadata/${file}.json`);
+            } catch (error) {
+              throw new Error(`Failed to read metadata for ${file}`);
+            }
             const asset: IAsset = {
+              metadata,
               filename: file,
               filepath: normalizedPath,
               stats: { size },
@@ -177,7 +216,7 @@ class LocalFileSourceProvider implements ISourceProvider {
     }
 
     if (encryption.enabled && encryption.key) {
-      streams.push(createDecryptionCipher(encryption.key));
+      streams.push(utils.encryption.createDecryptionCipher(encryption.key));
     }
 
     if (compression.enabled) {
@@ -272,8 +311,8 @@ class LocalFileSourceProvider implements ISourceProvider {
               const content = await entry.collect();
 
               try {
-                // Parse from buffer to string to JSON
-                const parsedContent = JSON.parse(content.toString());
+                // Parse from buffer array to string to JSON
+                const parsedContent = JSON.parse(Buffer.concat(content).toString());
 
                 // Resolve the Promise with the parsed content
                 resolve(parsedContent);
